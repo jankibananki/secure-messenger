@@ -22,10 +22,8 @@ func Run() {
 	window.CenterOnScreen()
 
 	pages := map[string]fyne.CanvasObject{
-		"Chat": newChatPage(),
-		"Files": newSectionPage(
-			"FILES",
-		),
+		"Chat":  newChatPage(),
+		"Files": newFilesPage(window),
 		"Auto Transfer": newSectionPage(
 			"AUTO TRANSFER",
 		),
