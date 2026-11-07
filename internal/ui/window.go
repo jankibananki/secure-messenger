@@ -28,9 +28,6 @@ func Run() {
 		"History": newSectionPage(
 			"HISTORY",
 		),
-		"Activity Log": newSectionPage(
-			"ACTIVITY LOG",
-		),
 		"Settings": newSectionPage(
 			"SETTINGS",
 		),

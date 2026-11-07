@@ -1,19 +1,18 @@
 package ui
 
 import (
-	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
-
-	"github.com/jankibananki/secure-messenger/internal/watcher"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/jankibananki/secure-messenger/internal/activitylog"
+	"github.com/jankibananki/secure-messenger/internal/watcher"
 )
 
 func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
@@ -26,34 +25,18 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 
 	monitoringStatus := widget.NewLabel("INACTIVE")
 
-	eventLog := widget.NewMultiLineEntry()
-	eventLog.SetMinRowsVisible(7)
-	eventLog.SetText("No events yet.")
-	eventLog.Disable()
-
-	var logLines []string
-
+	// Belezenje dogadjaja iskljucivo u log fajl
 	addLog := func(message string) {
-		line := fmt.Sprintf(
-			"[%s] %s",
-			time.Now().Format("15:04:05"),
-			message,
-		)
-
-		logLines = append(logLines, line)
-
-		if len(logLines) > 100 {
-			logLines = logLines[len(logLines)-100:]
+		if err := activitylog.Record(message); err != nil {
+			log.Printf("Failed to write activity log: %v", err)
 		}
-
-		eventLog.SetText(strings.Join(logLines, "\n"))
 	}
 
 	var startButton *widget.Button
 	var stopButton *widget.Button
 	var chooseButton *widget.Button
 
-	// Start local monitoring
+	// Pokretanje lokalnog monitoringa
 	startButton = widget.NewButton("Start monitoring", func() {
 		if selectedDir == "" || stopMonitoring != nil {
 			return
@@ -65,8 +48,8 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		stop, err := watcher.Start(
 			selectedDir,
 
+			// Detekcija novog fajla
 			func(path string) {
-				// Watcher callbacks run in a goroutine.
 				fyne.Do(func() {
 					if generation != id || stopMonitoring == nil {
 						return
@@ -76,6 +59,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 				})
 			},
 
+			// Obrada gresaka watchera
 			func(err error) {
 				fyne.Do(func() {
 					if generation != id || stopMonitoring == nil {
@@ -88,6 +72,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		)
 
 		if err != nil {
+			addLog("Failed to start monitoring: " + err.Error())
 			dialog.ShowError(err, window)
 			return
 		}
@@ -95,6 +80,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		stopMonitoring = stop
 
 		monitoringStatus.SetText("ACTIVE - Monitoring directory")
+
 		startButton.Disable()
 		stopButton.Enable()
 		chooseButton.Disable()
@@ -105,7 +91,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 	startButton.Importance = widget.HighImportance
 	startButton.Disable()
 
-	// Stop local monitoring
+	// Zaustavljanje lokalnog monitoringa
 	stopButton = widget.NewButton("Stop monitoring", func() {
 		if stopMonitoring == nil {
 			return
@@ -116,6 +102,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		generation++
 
 		monitoringStatus.SetText("INACTIVE")
+
 		stopButton.Disable()
 		startButton.Enable()
 		chooseButton.Enable()
@@ -125,7 +112,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 
 	stopButton.Disable()
 
-	// Choose local directory
+	// Izbor direktorijuma
 	chooseButton = widget.NewButtonWithIcon(
 		"Choose folder",
 		theme.FolderOpenIcon(),
@@ -171,6 +158,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		},
 	)
 
+	// Panel za izbor direktorijuma
 	folderPanel := widget.NewCard(
 		"Target directory",
 		"Choose the directory to monitor",
@@ -180,6 +168,7 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		),
 	)
 
+	// Panel za kontrolu monitoringa
 	monitoringPanel := widget.NewCard(
 		"Monitoring",
 		"Local test mode - no files are transferred",
@@ -193,23 +182,14 @@ func newAutoTransferPage(window fyne.Window) fyne.CanvasObject {
 		),
 	)
 
-	eventsPanel := widget.NewCard(
-		"Detected files",
-		"File system events",
-		eventLog,
-	)
-
-	return container.NewVScroll(
-		container.NewVBox(
-			widget.NewLabelWithStyle(
-				"AUTO TRANSFER",
-				fyne.TextAlignLeading,
-				fyne.TextStyle{Bold: true},
-			),
-			widget.NewSeparator(),
-			folderPanel,
-			monitoringPanel,
-			eventsPanel,
+	return container.NewVBox(
+		widget.NewLabelWithStyle(
+			"AUTO TRANSFER",
+			fyne.TextAlignLeading,
+			fyne.TextStyle{Bold: true},
 		),
+		widget.NewSeparator(),
+		folderPanel,
+		monitoringPanel,
 	)
 }
