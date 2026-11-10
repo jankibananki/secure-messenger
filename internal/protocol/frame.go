@@ -1,169 +1,230 @@
-
 package protocol
 
 import (
-	"bytes"
+	"crypto/subtle"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"strings"
-	"time"
+	"unicode/utf8"
 )
 
 const (
-	Version       = 1
-	MaxHeaderSize = 16 * 1024
+	Version          uint8 = 1
+	FixedHeaderSize        = 101
+	MaxFilenameBytes       = 255
 )
+
+// Tipovi paketa
+type PacketType uint8
 
 const (
-	TypeMessage  = "message"
-	TypeFile     = "file"
-	TypeACK      = "ack"
-	TypeFSWStart = "fsw_start"
-	TypeFSWStop  = "fsw_stop"
+	TypeMessage  PacketType = 1
+	TypeFile     PacketType = 2
+	TypeACK      PacketType = 3
+	TypeFSWStart PacketType = 4
+	TypeFSWStop  PacketType = 5
 )
 
-//json metadata header.
+// Algoritmi
+type Algorithm uint8
+
+const (
+	AlgorithmNone   Algorithm = 0
+	AlgorithmTEA    Algorithm = 1
+	AlgorithmLEACTR Algorithm = 2
+)
+
+// Binarni header
 type Header struct {
-	Version   int    `json:"version"`
-	Type      string `json:"type"`
-	Sender    string `json:"sender"`
-	Timestamp string `json:"timestamp"`
-	Algorithm string `json:"algorithm"`
-	Size      int64  `json:"size"`
-	MessageID string `json:"message_id"`
-	Filename  string `json:"filename,omitempty"`
-	IV        string `json:"iv,omitempty"`
-	Hash      string `json:"hash,omitempty"`
+	Size      uint32
+	Version   uint8
+	Type      PacketType
+	Sender    string
+	Timestamp int64
+	Algorithm Algorithm
+	IV        [16]byte
+	SHA256    [32]byte
+	Filename  string
 }
 
-//validate proverava da li header prati protokol
+// Provera ispravnosti headera
 func (h Header) Validate() error {
 	if h.Version != Version {
-		return fmt.Errorf("unsupported protocol version: %d", h.Version)
+		return fmt.Errorf("unsupported version: %d", h.Version)
 	}
 
 	switch h.Type {
 	case TypeMessage, TypeFile, TypeACK, TypeFSWStart, TypeFSWStop:
 	default:
-		return fmt.Errorf("unknown packet type: %s", h.Type)
+		return fmt.Errorf("unknown packet type: %d", h.Type)
 	}
 
-	if strings.TrimSpace(h.Sender) == "" {
-		return fmt.Errorf("missing sender")
+	if !validUUID(h.Sender) {
+		return errors.New("sender must be a valid 36-byte UUID")
 	}
 
-	if _, err := time.Parse(time.RFC3339Nano, h.Timestamp); err != nil {
-		return fmt.Errorf("invalid timestamp: %w", err)
+	if len(h.Filename) > MaxFilenameBytes ||
+		!utf8.ValidString(h.Filename) {
+		return errors.New("invalid filename")
 	}
 
-	if strings.TrimSpace(h.MessageID) == "" {
-		return fmt.Errorf("missing message_id")
+	if h.Filename == "." || h.Filename == ".." ||
+		strings.ContainsAny(h.Filename, "/\\\x00") {
+		return errors.New("unsafe filename")
 	}
 
-	if h.Size < 0 {
-		return fmt.Errorf("negative payload size")
-	}
-
-	if h.Type == TypeFile && h.Filename == "" {
-		return fmt.Errorf("missing filename")
-	}
-
-	if h.Type == TypeMessage || h.Type == TypeFile {
-		if h.Algorithm != "TEA" && h.Algorithm != "LEA-CTR" {
-			return fmt.Errorf("unsupported algorithm: %s", h.Algorithm)
+	switch h.Type {
+	case TypeMessage, TypeFile:
+		if h.Algorithm != AlgorithmTEA &&
+			h.Algorithm != AlgorithmLEACTR {
+			return errors.New("unsupported encryption algorithm")
 		}
 
-		if len(h.Hash) != 64 {
-			return fmt.Errorf("hash must contain 64 hex characters")
+		if h.Type == TypeFile && h.Filename == "" {
+			return errors.New("missing filename")
 		}
 
-		if _, err := hex.DecodeString(h.Hash); err != nil {
-			return fmt.Errorf("invalid hash: %w", err)
+		if h.Type == TypeMessage {
+			if h.Size == 0 || h.Filename != "" {
+				return errors.New("invalid message packet")
+			}
 		}
 
-		if h.Algorithm == "LEA-CTR" && h.IV == "" {
-			return fmt.Errorf("missing IV for LEA-CTR")
+	default:
+		// ACK i FSW komande nemaju payload.
+		if h.Size != 0 ||
+			h.Algorithm != AlgorithmNone ||
+			h.Filename != "" {
+			return errors.New("invalid control packet")
 		}
-	} else {
-		//kontrolni paketi zasad nemaju payload.
-		if h.Size != 0 || h.Algorithm != "none" {
-			return fmt.Errorf("invalid control packet")
+
+		if h.IV != [16]byte{} ||
+			h.SHA256 != [32]byte{} {
+			return errors.New("invalid control packet metadata")
 		}
 	}
 
 	return nil
 }
 
-// WriteFrame zapisuje:
-// [4B duzina headera][JSON header][encrypted payload]
-func WriteFrame(w io.Writer, h Header, payload io.Reader) error {
+// Slanje kompletnog frejma:
+// [fixed header][filename][encrypted payload]
+func WriteFrame(
+	w io.Writer,
+	h Header,
+	ciphertext io.Reader,
+) error {
 	if err := h.Validate(); err != nil {
 		return err
 	}
 
-	if h.Size > 0 && payload == nil {
-		return fmt.Errorf("missing payload")
+	if h.Size > 0 && ciphertext == nil {
+		return errors.New("missing ciphertext")
 	}
 
-	headerBytes, err := json.Marshal(h)
-	if err != nil {
-		return err
-	}
+	var fixed [FixedHeaderSize]byte
 
-	if len(headerBytes) > MaxHeaderSize {
-		return fmt.Errorf("header too large")
-	}
+	// SIZE: bajtovi 0-3
+	binary.BigEndian.PutUint32(fixed[0:4], h.Size)
 
-	var prefix [4]byte
-	binary.BigEndian.PutUint32(
-		prefix[:],
-		uint32(len(headerBytes)),
+	// VERSION: bajt 4
+	fixed[4] = h.Version
+
+	// TYPE: bajt 5
+	fixed[5] = byte(h.Type)
+
+	// SENDER UUID: bajtovi 6-41
+	copy(fixed[6:42], h.Sender)
+
+	// TIMESTAMP: bajtovi 42-49
+	binary.BigEndian.PutUint64(
+		fixed[42:50],
+		uint64(h.Timestamp),
 	)
 
-	if _, err := io.Copy(w, bytes.NewReader(prefix[:])); err != nil {
+	// ALGORITHM: bajt 50
+	fixed[50] = byte(h.Algorithm)
+
+	// IV: bajtovi 51-66
+	copy(fixed[51:67], h.IV[:])
+
+	// SHA-256: bajtovi 67-98
+	copy(fixed[67:99], h.SHA256[:])
+
+	// FILENAME SIZE: bajtovi 99-100
+	binary.BigEndian.PutUint16(
+		fixed[99:101],
+		uint16(len(h.Filename)),
+	)
+
+	// Upis fiksnog dela headera
+	if err := writeAll(w, fixed[:]); err != nil {
 		return err
 	}
 
-	if _, err := io.Copy(w, bytes.NewReader(headerBytes)); err != nil {
+	// Upis naziva fajla, ako postoji
+	if err := writeAll(w, []byte(h.Filename)); err != nil {
 		return err
 	}
 
-	if h.Size > 0 {
-		if _, err := io.CopyN(w, payload, h.Size); err != nil {
-			return err
-		}
+	// Kontrolni paket: nema payload-a
+	if h.Size == 0 {
+		return nil
 	}
 
-	return nil
+	// Upis tacno SIZE bajtova
+	_, err := io.CopyN(
+		w,
+		ciphertext,
+		int64(h.Size),
+	)
+
+	return err
 }
 
-// readHeader cita duzinu headera i JSON metadata header.
+// Citanje binarnog headera iz TCP stream-a
 func ReadHeader(r io.Reader) (Header, error) {
 	var h Header
-	var prefix [4]byte
+	var fixed [FixedHeaderSize]byte
 
-	if _, err := io.ReadFull(r, prefix[:]); err != nil {
+	// Citamo tacno 101 bajt.
+	if _, err := io.ReadFull(r, fixed[:]); err != nil {
 		return h, err
 	}
 
-	headerSize := binary.BigEndian.Uint32(prefix[:])
+	h.Size = binary.BigEndian.Uint32(fixed[0:4])
+	h.Version = fixed[4]
+	h.Type = PacketType(fixed[5])
+	h.Sender = string(fixed[6:42])
 
-	if headerSize == 0 || headerSize > MaxHeaderSize {
-		return h, fmt.Errorf("invalid header size: %d", headerSize)
+	h.Timestamp = int64(
+		binary.BigEndian.Uint64(fixed[42:50]),
+	)
+
+	h.Algorithm = Algorithm(fixed[50])
+
+	copy(h.IV[:], fixed[51:67])
+	copy(h.SHA256[:], fixed[67:99])
+
+	filenameSize := binary.BigEndian.Uint16(
+		fixed[99:101],
+	)
+
+	if filenameSize > MaxFilenameBytes {
+		return h, errors.New("filename too long")
 	}
 
-	headerBytes := make([]byte, headerSize)
+	// Naziv fajla je promenljive duzine.
+	filename := make([]byte, filenameSize)
 
-	if _, err := io.ReadFull(r, headerBytes); err != nil {
+	if _, err := io.ReadFull(r, filename); err != nil {
 		return h, err
 	}
 
-	if err := json.Unmarshal(headerBytes, &h); err != nil {
-		return h, err
-	}
+	h.Filename = string(filename)
 
 	if err := h.Validate(); err != nil {
 		return h, err
@@ -172,12 +233,94 @@ func ReadHeader(r io.Reader) (Header, error) {
 	return h, nil
 }
 
-// ReadPayload cita tacno h.Size bajtova, podaci se upisuju u dst bez ucitavanja celog fajla u ram
-func ReadPayload(r io.Reader, h Header, dst io.Writer) error {
-	if h.Size < 0 {
-		return fmt.Errorf("negative payload size")
+// Cita ciphertext i proverava SHA-256.
+// Prosledjeni hasher mora biti nova SHA-256 instanca.
+// Koristicemo nasu implementaciju SHA-256 kada je napravimo.
+func ReadPayloadVerified(
+	r io.Reader,
+	h Header,
+	dst io.Writer,
+	hasher hash.Hash,
+) error {
+	if err := h.Validate(); err != nil {
+		return err
 	}
 
-	_, err := io.CopyN(dst, r, h.Size)
-	return err
+	if h.Size == 0 && h.Type != TypeFile {
+		return nil
+	}
+
+	if dst == nil || hasher == nil {
+		return errors.New("missing destination or hasher")
+	}
+
+	if hasher.Size() != 32 {
+		return errors.New("SHA-256 hasher required")
+	}
+
+	// Istovremeno upisujemo ciphertext i racunamo hash.
+	_, err := io.CopyN(
+		io.MultiWriter(dst, hasher),
+		r,
+		int64(h.Size),
+	)
+
+	if err != nil {
+		return err
+	}
+
+	// Provera integriteta pre desifrovanja
+	if subtle.ConstantTimeCompare(
+		hasher.Sum(nil),
+		h.SHA256[:],
+	) != 1 {
+		return errors.New("ciphertext SHA-256 mismatch")
+	}
+
+	return nil
+}
+
+// Upisuje sve bajtove i kada Writer vraca krace upise.
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+
+		if err != nil {
+			return err
+		}
+
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+
+		data = data[n:]
+	}
+
+	return nil
+}
+
+// Proverava format UUID-a sa crticama.
+func validUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+
+	for i := 0; i < len(s); i++ {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if s[i] != '-' {
+				return false
+			}
+			continue
+		}
+
+		c := s[i]
+
+		if !((c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'f') ||
+			(c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+
+	return true
 }

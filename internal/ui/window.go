@@ -51,6 +51,7 @@ func Run() {
 		),
 		widget.NewSeparator(),
 	)
+
 	navigation := []struct {
 		name string
 		icon fyne.Resource
@@ -59,14 +60,18 @@ func Run() {
 		{"Files", theme.FolderIcon()},
 		{"Auto Transfer", theme.FolderOpenIcon()},
 		{"History", theme.HistoryIcon()},
-		{"Activity Log", theme.InfoIcon()},
 		{"Settings", theme.SettingsIcon()},
 	}
 
 	backgrounds := make(map[string]*canvas.Rectangle)
 
 	showPage := func(name string) {
-		mainArea.Objects = []fyne.CanvasObject{pages[name]}
+		page, exists := pages[name]
+		if !exists || page == nil {
+			return
+		}
+
+		mainArea.Objects = []fyne.CanvasObject{page}
 		mainArea.Refresh()
 
 		for key, bg := range backgrounds {
